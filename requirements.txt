@@ -1,0 +1,7 @@
+streamlit
+pandas
+ortools
+openpyxl
+plotly
+fpdf
+graphviz
