@@ -94,7 +94,7 @@ else:
     min_w = st.sidebar.number_input("Minimum Workers", min_value=1, max_value=100, value=15, step=1)
     max_w = st.sidebar.number_input("Maximum Workers", min_value=2, max_value=100, value=35, step=1)
 
-# --- STEP 1: UPLOAD ---
+# --- STEP 1: UPLOAD & BULLETPROOF CLEANING ---
 st.header("Step 1: Upload Excel/CSV")
 uploaded_file = st.file_uploader("Upload your Operation Bulletin", type=["xlsx", "csv"])
 
@@ -103,19 +103,27 @@ if uploaded_file is not None:
         if uploaded_file.name.endswith('.csv'): df = pd.read_csv(uploaded_file)
         else: df = pd.read_excel(uploaded_file)
         
-        # Ensure Operation Description exists
+        # Ensure columns exist
         if 'Operation Description' not in df.columns and 'Operation' in df.columns:
             df = df.rename(columns={'Operation': 'Operation Description'})
+            
+        # 1. Force strings and remove completely empty/NaN rows
+        df['Operation Description'] = df['Operation Description'].astype(str).str.strip().str.upper()
+        df = df[~df['Operation Description'].isin(['', 'NAN', 'NONE', 'NULL'])]
+        
+        # 2. Force SAM to numeric, treating spaces/blanks as 0.0
+        if 'SAM' in df.columns:
+            df['SAM'] = pd.to_numeric(df['SAM'], errors='coerce').fillna(0.0)
+        else:
+            df['SAM'] = 0.0
             
         # --- PHASE 1: COLLECT BASE SUB-ASSEMBLY IDS ---
         base_sub_ids = []
         for index, row in df.iterrows():
-            sam_val = row.get('SAM', 0)
-            desc = str(row.get('Operation Description', '')).strip().upper()
-            if pd.isna(sam_val) or sam_val == 0 or sam_val == '':
-                if desc and str(desc).lower() != 'nan':
-                    if desc not in base_sub_ids:
-                        base_sub_ids.append(desc)
+            sam_val = row['SAM']
+            desc = row['Operation Description']
+            if sam_val == 0.0 and desc not in base_sub_ids:
+                base_sub_ids.append(desc)
                         
         # --- PHASE 2: SMART AUTO-TAGGING ---
         current_sub_id = "General Assembly"
@@ -123,35 +131,32 @@ if uploaded_file is not None:
         ignore_keywords = ["ASSEMBLY", "TAPE", "BINDING", "THE", "AND", "WITH"]
         
         for index, row in df.iterrows():
-            sam_val = row.get('SAM', 0)
-            desc = str(row.get('Operation Description', '')).strip().upper()
+            sam_val = row['SAM']
+            desc = row['Operation Description']
             
-            # If SAM is empty/0, it's a Header
-            if pd.isna(sam_val) or sam_val == 0 or sam_val == '':
-                if desc and str(desc).lower() != 'nan':
-                    current_sub_id = desc
+            # If SAM is 0.0, it's a Header
+            if sam_val == 0.0:
+                current_sub_id = desc
             else:
-                if desc and str(desc).lower() != 'nan':
-                    assigned_id = current_sub_id
-                    
-                    # --- SMART MERGE LOGIC ---
-                    if "ASSEMBLE" in desc or "JOIN" in desc or "ATTACH" in desc:
-                        for base_id in base_sub_ids:
-                            if base_id == current_sub_id: continue 
-                            
-                            keywords = [k for k in base_id.replace('+', ' ').replace('/', ' ').split() if len(k) > 3 and k not in ignore_keywords]
-                            
-                            match_found = False
-                            for kw in keywords:
-                                if kw in desc: match_found = True; break
-                                    
-                            if match_found:
-                                assigned_id = f"Merge: {current_sub_id} + {base_id}"
-                                break 
-                    
-                    row['Sub-Assembly ID'] = assigned_id
-                    valid_rows.append(row)
-                    
+                assigned_id = current_sub_id
+                
+                # --- SMART MERGE LOGIC ---
+                if "ASSEMBLE" in desc or "JOIN" in desc or "ATTACH" in desc:
+                    for base_id in base_sub_ids:
+                        if base_id == current_sub_id: continue 
+                        
+                        keywords = [k for k in base_id.replace('+', ' ').replace('/', ' ').split() if len(k) > 3 and k not in ignore_keywords]
+                        match_found = False
+                        for kw in keywords:
+                            if kw in desc: match_found = True; break
+                                
+                        if match_found:
+                            assigned_id = f"Merge: {current_sub_id} + {base_id}"
+                            break 
+                
+                row['Sub-Assembly ID'] = assigned_id
+                valid_rows.append(row)
+                
         clean_df = pd.DataFrame(valid_rows)
         
         # --- STEP 2: REVIEW SUB-ASSEMBLY IDS ---
@@ -166,12 +171,9 @@ if uploaded_file is not None:
         
         for sub_id, group in edited_df.groupby('Sub-Assembly ID', sort=False):
             ops = group['Operation Description'].tolist()
-            
-            # 1. Sequential linking within the group
             for i in range(len(ops)-1):
                 precedence_list.append({"Before Operation": ops[i], "After Operation": ops[i+1]})
                 
-            # 2. Smart Merge linking between groups
             if str(sub_id).startswith("Merge:"):
                 parts = str(sub_id).replace("Merge:", "").split("+")
                 for part in parts:
@@ -189,10 +191,26 @@ if uploaded_file is not None:
         st.header("Step 3: Review Precedence Flow")
         st.markdown("The system auto-linked sequences and merges. **Add or delete rows in the table below to fix any logic errors.**")
         
+        # NEW OVERRIDE LOGIC
+        st.info("💡 **Have a saved precedence table?** Upload it here to immediately override the auto-generated logic.")
+        prec_upload = st.file_uploader("Upload Saved Precedence Table (CSV)", type=["csv"], key="prec_uploader")
+        
+        if prec_upload is not None:
+            uploaded_prec = pd.read_csv(prec_upload)
+            if 'Before Operation' in uploaded_prec.columns and 'After Operation' in uploaded_prec.columns:
+                prec_df = uploaded_prec
+                st.success("✅ Custom Precedence applied!")
+            else:
+                st.error("❌ The uploaded CSV must contain 'Before Operation' and 'After Operation' columns.")
+
         col_table, col_chart = st.columns([1, 1.5])
         
         with col_table:
             edited_prec_df = st.data_editor(prec_df, num_rows="dynamic", use_container_width=True)
+            
+            # Export button for saving custom configurations
+            csv_prec = edited_prec_df.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Download This Precedence Table", data=csv_prec, file_name="custom_precedence.csv", mime="text/csv", use_container_width=True)
         
         with col_chart:
             st.markdown("### Precedence Flowchart")
@@ -210,14 +228,17 @@ if uploaded_file is not None:
                         final_precedence_tuples.append((before_str, after_str))
                         
             st.graphviz_chart(dot)
-            graph_export = dot.pipe(format='svg')
-            st.download_button(label="📥 Download Flowchart (SVG)", data=graph_export, file_name="precedence_flowchart.svg", mime="image/svg+xml")
 
         # --- STEP 4: OPTIMIZATION ENGINE ---
         st.divider()
         st.header("Step 4: Run Math Engine")
         
         if st.button("🚀 Confirm Flow & Run Optimization", type="primary"):
+            
+            # Final Safety Catch for User Inputs
+            if mode == "Type 1: Minimize Headcount" and target_cycle_time is None: target_cycle_time = 1.5
+            
+            edited_df['SAM'] = pd.to_numeric(edited_df['SAM'], errors='coerce').fillna(0.0)
             operations = edited_df['Operation Description'].astype(str).tolist()
             sam = dict(zip(edited_df['Operation Description'], edited_df['SAM']))
             machines = dict(zip(edited_df['Operation Description'], edited_df['Machine'].fillna("MANUAL")))
@@ -239,7 +260,6 @@ if uploaded_file is not None:
                         efficiency[op_name][j] = 1.0
 
             final_status, final_x, final_y, final_headcount, final_cycle_time = None, None, None, None, None
-            simulation_df = None
             
             with st.spinner(f'Executing {mode} Mathematics...'):
                 if mode == "Type 1: Minimize Headcount":
@@ -248,41 +268,9 @@ if uploaded_file is not None:
                 elif mode == "Type 2: Minimize Cycle Time":
                     final_status, final_x, final_y, final_headcount, final_cycle_time = run_solver(
                         operations, sam, machines, machine_types, final_precedence_tuples, efficiency, fixed_workstations, mode, None, max_machines)
-                else: 
-                    sim_results = []
-                    best_eff = 0
-                    best_w = min_w
-                    prog_bar = st.progress(0)
-                    total_tests = (max_w - min_w) + 1
-                    
-                    for idx, w in enumerate(range(min_w, max_w + 1)):
-                        status, x, y, h, c_time = run_solver(
-                            operations, sam, machines, machine_types, final_precedence_tuples, efficiency, w, mode, None, max_machines)
-                        if status == pywraplp.Solver.OPTIMAL:
-                            eff_val = (total_sam / (h * c_time)) * 100
-                            sim_results.append({"Workers": h, "Cycle Time (mins)": round(c_time, 2), "Efficiency (%)": round(eff_val, 2)})
-                            if eff_val > best_eff:
-                                best_eff = eff_val
-                                best_w = w
-                        prog_bar.progress((idx + 1) / total_tests)
-                        
-                    if sim_results:
-                        simulation_df = pd.DataFrame(sim_results)
-                        final_status, final_x, final_y, final_headcount, final_cycle_time = run_solver(
-                            operations, sam, machines, machine_types, final_precedence_tuples, efficiency, best_w, mode, None, max_machines)
 
             if final_status == pywraplp.Solver.OPTIMAL:
-                if mode == "Type E: Maximize Efficiency" and simulation_df is not None:
-                    st.success(f"✅ Simulation Complete! The most efficient setup requires **{final_headcount} workers**.")
-                    col_chart1, col_chart2 = st.columns([1, 2])
-                    with col_chart1: st.dataframe(simulation_df, use_container_width=True)
-                    with col_chart2:
-                        fig_line = px.line(simulation_df, x="Workers", y="Efficiency (%)", text="Efficiency (%)", markers=True, title="Efficiency vs. Headcount")
-                        fig_line.update_traces(textposition="top center")
-                        st.plotly_chart(fig_line, use_container_width=True)
-                    st.divider()
-                else:
-                    st.success(f"✅ Optimal Balance Found! Total Operators: **{final_headcount}** | Cycle Time: **{final_cycle_time:.2f} mins**")
+                st.success(f"✅ Optimal Balance Found! Total Operators: **{final_headcount}** | Cycle Time: **{final_cycle_time:.2f} mins**")
                 
                 results_data = []
                 chart_data = []
@@ -290,15 +278,11 @@ if uploaded_file is not None:
                 
                 for j in range(1, final_headcount + 1):
                     assigned_ops = [i for i in operations if final_x[i, j].SolutionValue() > 0.5]
-                    if not assigned_ops:
-                        total_time = 0.0
-                        station_machines = []
+                    if not assigned_ops: total_time = 0.0; station_machines = []
                     else:
                         total_time = sum([sam[i] / efficiency[i][j] for i in assigned_ops])
                         station_machines = [m for m in machine_types if final_y[m, j].SolutionValue() > 0.5]
-                        for op in assigned_ops:
-                            op_time = sam[op] / efficiency[op][j]
-                            chart_data.append({"Workstation": f"Station {j}", "Operation": op, "Time (mins)": op_time})
+                        for op in assigned_ops: chart_data.append({"Workstation": f"Station {j}", "Operation": op, "Time (mins)": sam[op] / efficiency[op][j]})
                     
                     operator_type = f"Real Worker ({j})" if j <= num_real_operators else f"Standard Worker ({j})"
                     results_data.append({
@@ -315,7 +299,6 @@ if uploaded_file is not None:
                             else:
                                 st.caption(f"👤 {operator_type}")
                                 st.markdown(f"**Machines:** {', '.join(station_machines)}")
-                                st.markdown(f"**Steps:** {', '.join(assigned_ops)}")
                                 st.progress(min(total_time / final_cycle_time, 1.0))
                                 st.markdown(f"**Load:** {total_time:.2f} / {final_cycle_time:.2f} mins")
                             st.divider()
@@ -326,16 +309,7 @@ if uploaded_file is not None:
                     fig = px.bar(df_chart, x="Workstation", y="Time (mins)", color="Operation", text="Operation")
                     fig.add_hline(y=final_cycle_time, line_dash="dash", line_color="red", annotation_text=f"Cycle Time: {final_cycle_time:.2f}m")
                     st.plotly_chart(fig, use_container_width=True)
-
-                st.markdown("### 📥 Export Factory Floor Plans")
-                col1, col2 = st.columns(2)
-                with col1:
-                    csv_export = pd.DataFrame(results_data).to_csv(index=False).encode('utf-8')
-                    st.download_button(label="📄 Download Data (CSV)", data=csv_export, file_name='optimized_line_balance.csv', mime='text/csv', use_container_width=True)
-                with col2:
-                    pdf_bytes = create_pdf_report(results_data, mode, final_cycle_time, final_headcount)
-                    st.download_button(label="🖨️ Download Action Sheet (PDF)", data=pdf_bytes, file_name='line_balancing_report.pdf', mime='application/pdf', type="primary", use_container_width=True)
             else:
-                st.error("❌ The solver could not find a valid solution. Try increasing limits or checking precedence rules for deadlocks.")
+                st.error("❌ The solver could not find a valid solution. Try checking precedence rules for deadlocks.")
     except Exception as e:
-        st.error(f"An error occurred: {e}. Please ensure your Excel file matches the required template.")
+        st.error(f"An error occurred: {e}. Please ensure your file matches the template.")
