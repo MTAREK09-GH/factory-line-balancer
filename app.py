@@ -103,21 +103,17 @@ if uploaded_file is not None:
         if uploaded_file.name.endswith('.csv'): df = pd.read_csv(uploaded_file)
         else: df = pd.read_excel(uploaded_file)
         
-        # Ensure columns exist
         if 'Operation Description' not in df.columns and 'Operation' in df.columns:
             df = df.rename(columns={'Operation': 'Operation Description'})
             
-        # 1. Force strings and remove completely empty/NaN rows
         df['Operation Description'] = df['Operation Description'].astype(str).str.strip().str.upper()
         df = df[~df['Operation Description'].isin(['', 'NAN', 'NONE', 'NULL'])]
         
-        # 2. Force SAM to numeric, treating spaces/blanks as 0.0
         if 'SAM' in df.columns:
             df['SAM'] = pd.to_numeric(df['SAM'], errors='coerce').fillna(0.0)
         else:
             df['SAM'] = 0.0
             
-        # --- PHASE 1: COLLECT BASE SUB-ASSEMBLY IDS ---
         base_sub_ids = []
         for index, row in df.iterrows():
             sam_val = row['SAM']
@@ -125,7 +121,6 @@ if uploaded_file is not None:
             if sam_val == 0.0 and desc not in base_sub_ids:
                 base_sub_ids.append(desc)
                         
-        # --- PHASE 2: SMART AUTO-TAGGING ---
         current_sub_id = "General Assembly"
         valid_rows = []
         ignore_keywords = ["ASSEMBLY", "TAPE", "BINDING", "THE", "AND", "WITH"]
@@ -134,13 +129,10 @@ if uploaded_file is not None:
             sam_val = row['SAM']
             desc = row['Operation Description']
             
-            # If SAM is 0.0, it's a Header
             if sam_val == 0.0:
                 current_sub_id = desc
             else:
                 assigned_id = current_sub_id
-                
-                # --- SMART MERGE LOGIC ---
                 if "ASSEMBLE" in desc or "JOIN" in desc or "ATTACH" in desc:
                     for base_id in base_sub_ids:
                         if base_id == current_sub_id: continue 
@@ -164,37 +156,66 @@ if uploaded_file is not None:
         st.header("Step 2: Review Sub-Assembly Tags")
         st.markdown("The Smart Tagger assigned components and predicted Merges. **Click any cell in the 'Sub-Assembly ID' column to edit.**")
         
-        edited_df = st.data_editor(clean_df, num_rows="dynamic", use_container_width=True)
+        # HIDE INDEX REMOVES THE UGLY ROW NUMBERS
+        edited_df = st.data_editor(clean_df, num_rows="dynamic", use_container_width=True, hide_index=True)
         
         # --- AUTO-PRECEDENCE & MERGE LINKING LOGIC ---
         precedence_list = []
         
-        for sub_id, group in edited_df.groupby('Sub-Assembly ID', sort=False):
-            ops = group['Operation Description'].tolist()
-            for i in range(len(ops)-1):
-                precedence_list.append({"Before Operation": ops[i], "After Operation": ops[i+1]})
+        try:
+            edited_df['Sub-Assembly ID'] = edited_df['Sub-Assembly ID'].astype(str)
+            for sub_id, group in edited_df.groupby('Sub-Assembly ID', sort=False):
+                ops = group['Operation Description'].dropna().tolist()
                 
-            if str(sub_id).startswith("Merge:"):
-                parts = str(sub_id).replace("Merge:", "").split("+")
-                for part in parts:
-                    target_sub_id = part.strip()
-                    target_group = edited_df[edited_df['Sub-Assembly ID'] == target_sub_id]
-                    if not target_group.empty:
-                        last_op = target_group['Operation Description'].iloc[-1]
-                        first_merge_op = ops[0]
-                        precedence_list.append({"Before Operation": last_op, "After Operation": first_merge_op})
-        
-        prec_df = pd.DataFrame(precedence_list).drop_duplicates()
+                # ABSOLUTE SAFETY LOCK
+                if len(ops) == 0: continue 
+                
+                for i in range(len(ops)-1):
+                    precedence_list.append({"Before Operation": ops[i], "After Operation": ops[i+1]})
+                    
+                if str(sub_id).startswith("Merge:"):
+                    parts = str(sub_id).replace("Merge:", "").split("+")
+                    for part in parts:
+                        target_sub_id = part.strip()
+                        target_group = edited_df[edited_df['Sub-Assembly ID'] == target_sub_id]
+                        t_ops = target_group['Operation Description'].dropna().tolist()
+                        
+                        # DOUBLE SAFETY LOCK
+                        if len(t_ops) > 0 and len(ops) > 0:
+                            last_op = t_ops[-1]
+                            first_merge_op = ops[0]
+                            precedence_list.append({"Before Operation": last_op, "After Operation": first_merge_op})
+        except Exception as e:
+            st.warning("⚠️ The auto-linker skipped a broken rule. Please upload your custom CSV below to apply perfect rules.")
+            
+        if precedence_list:
+            prec_df = pd.DataFrame(precedence_list).drop_duplicates()
+        else:
+            prec_df = pd.DataFrame(columns=["Before Operation", "After Operation"])
         
         # --- STEP 3: REVIEW PRECEDENCE & FLOWCHART ---
         st.divider()
         st.header("Step 3: Review Precedence Flow")
         st.markdown("The system auto-linked sequences and merges. **Add or delete rows in the table below to fix any logic errors.**")
         
+        st.info("💡 **Have a saved precedence table?** Upload it here to immediately override the auto-generated logic.")
+        prec_upload = st.file_uploader("Upload Saved Precedence Table (CSV)", type=["csv"], key="prec_uploader")
+        
+        if prec_upload is not None:
+            uploaded_prec = pd.read_csv(prec_upload, sep=None, engine='python')
+            if 'Before Operation' in uploaded_prec.columns and 'After Operation' in uploaded_prec.columns:
+                prec_df = uploaded_prec
+                st.success("✅ Custom Precedence applied!")
+            else:
+                st.error("❌ The uploaded CSV must contain 'Before Operation' and 'After Operation' columns.")
+
         col_table, col_chart = st.columns([1, 1.5])
         
         with col_table:
-            edited_prec_df = st.data_editor(prec_df, num_rows="dynamic", use_container_width=True)
+            # HIDE INDEX REMOVES THE "NONE" BOXES FOREVER
+            edited_prec_df = st.data_editor(prec_df, num_rows="dynamic", use_container_width=True, hide_index=True)
+            csv_prec = edited_prec_df.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Download This Precedence Table", data=csv_prec, file_name="custom_precedence.csv", mime="text/csv", use_container_width=True)
         
         with col_chart:
             st.markdown("### Precedence Flowchart")
@@ -218,8 +239,6 @@ if uploaded_file is not None:
         st.header("Step 4: Run Math Engine")
         
         if st.button("🚀 Confirm Flow & Run Optimization", type="primary"):
-            
-            # Final Safety Catch for User Inputs
             if mode == "Type 1: Minimize Headcount" and target_cycle_time is None: target_cycle_time = 1.5
             
             edited_df['SAM'] = pd.to_numeric(edited_df['SAM'], errors='coerce').fillna(0.0)
@@ -227,7 +246,6 @@ if uploaded_file is not None:
             sam = dict(zip(edited_df['Operation Description'], edited_df['SAM']))
             machines = dict(zip(edited_df['Operation Description'], edited_df['Machine'].fillna("MANUAL")))
             machine_types = list(set(machines.values()))
-            total_sam = sum(sam.values())
             
             real_operator_cols = [col for col in edited_df.columns if col.startswith('Op_')]
             num_real_operators = len(real_operator_cols)
@@ -243,15 +261,28 @@ if uploaded_file is not None:
                     else:
                         efficiency[op_name][j] = 1.0
 
+            # --- VALIDATION SHIELD ---
+            valid_precedence = []
+            missing_ops = set()
+            for b, a in final_precedence_tuples:
+                if b in operations and a in operations:
+                    valid_precedence.append((b, a))
+                else:
+                    if b not in operations: missing_ops.add(b)
+                    if a not in operations: missing_ops.add(a)
+                    
+            if missing_ops:
+                st.warning(f"⚠️ **Warning:** The following operations in your Precedence Table do not exactly match the operations in your Step 1 data (check for typos or extra spaces). Their precedence rules were ignored to prevent a crash: \n\n {', '.join(missing_ops)}")
+
             final_status, final_x, final_y, final_headcount, final_cycle_time = None, None, None, None, None
             
             with st.spinner(f'Executing {mode} Mathematics...'):
                 if mode == "Type 1: Minimize Headcount":
                     final_status, final_x, final_y, final_headcount, final_cycle_time = run_solver(
-                        operations, sam, machines, machine_types, final_precedence_tuples, efficiency, max_allowed_headcount, mode, target_cycle_time, max_machines)
+                        operations, sam, machines, machine_types, valid_precedence, efficiency, max_allowed_headcount, mode, target_cycle_time, max_machines)
                 elif mode == "Type 2: Minimize Cycle Time":
                     final_status, final_x, final_y, final_headcount, final_cycle_time = run_solver(
-                        operations, sam, machines, machine_types, final_precedence_tuples, efficiency, fixed_workstations, mode, None, max_machines)
+                        operations, sam, machines, machine_types, valid_precedence, efficiency, fixed_workstations, mode, None, max_machines)
 
             if final_status == pywraplp.Solver.OPTIMAL:
                 st.success(f"✅ Optimal Balance Found! Total Operators: **{final_headcount}** | Cycle Time: **{final_cycle_time:.2f} mins**")
@@ -294,6 +325,6 @@ if uploaded_file is not None:
                     fig.add_hline(y=final_cycle_time, line_dash="dash", line_color="red", annotation_text=f"Cycle Time: {final_cycle_time:.2f}m")
                     st.plotly_chart(fig, use_container_width=True)
             else:
-                st.error("❌ The solver could not find a valid solution. Try checking precedence rules for deadlocks.")
+                st.error("❌ The solver could not find a valid solution. Try checking precedence rules for deadlocks or increasing the target cycle time.")
     except Exception as e:
         st.error(f"An error occurred: {e}. Please ensure your file matches the template.")
