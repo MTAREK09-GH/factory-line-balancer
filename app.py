@@ -103,12 +103,15 @@ if uploaded_file is not None:
         if uploaded_file.name.endswith('.csv'): df = pd.read_csv(uploaded_file)
         else: df = pd.read_excel(uploaded_file)
         
+        # Ensure columns exist
         if 'Operation Description' not in df.columns and 'Operation' in df.columns:
             df = df.rename(columns={'Operation': 'Operation Description'})
             
+        # 1. Force strings and remove completely empty/NaN rows
         df['Operation Description'] = df['Operation Description'].astype(str).str.strip().str.upper()
         df = df[~df['Operation Description'].isin(['', 'NAN', 'NONE', 'NULL'])]
         
+        # 2. Force SAM to numeric, treating spaces/blanks as 0.0
         if 'SAM' in df.columns:
             df['SAM'] = pd.to_numeric(df['SAM'], errors='coerce').fillna(0.0)
         else:
@@ -131,10 +134,13 @@ if uploaded_file is not None:
             sam_val = row['SAM']
             desc = row['Operation Description']
             
+            # If SAM is 0.0, it's a Header
             if sam_val == 0.0:
                 current_sub_id = desc
             else:
                 assigned_id = current_sub_id
+                
+                # --- SMART MERGE LOGIC ---
                 if "ASSEMBLE" in desc or "JOIN" in desc or "ATTACH" in desc:
                     for base_id in base_sub_ids:
                         if base_id == current_sub_id: continue 
@@ -160,59 +166,35 @@ if uploaded_file is not None:
         
         edited_df = st.data_editor(clean_df, num_rows="dynamic", use_container_width=True)
         
-        # --- AUTO-PRECEDENCE & MERGE LINKING LOGIC WITH GOD-MODE SHIELD ---
+        # --- AUTO-PRECEDENCE & MERGE LINKING LOGIC ---
         precedence_list = []
         
-        try:
-            edited_df['Sub-Assembly ID'] = edited_df['Sub-Assembly ID'].astype(str)
-            for sub_id, group in edited_df.groupby('Sub-Assembly ID', sort=False):
-                ops = group['Operation Description'].dropna().tolist()
-                if not ops: continue 
+        for sub_id, group in edited_df.groupby('Sub-Assembly ID', sort=False):
+            ops = group['Operation Description'].tolist()
+            for i in range(len(ops)-1):
+                precedence_list.append({"Before Operation": ops[i], "After Operation": ops[i+1]})
                 
-                for i in range(len(ops)-1):
-                    precedence_list.append({"Before Operation": ops[i], "After Operation": ops[i+1]})
-                    
-                if str(sub_id).startswith("Merge:"):
-                    parts = str(sub_id).replace("Merge:", "").split("+")
-                    for part in parts:
-                        target_sub_id = part.strip()
-                        target_group = edited_df[edited_df['Sub-Assembly ID'] == target_sub_id]
-                        t_ops = target_group['Operation Description'].dropna().tolist()
-                        
-                        if t_ops and ops:
-                            last_op = t_ops[-1]
-                            first_merge_op = ops[0]
-                            precedence_list.append({"Before Operation": last_op, "After Operation": first_merge_op})
-        except Exception as e:
-            st.warning("⚠️ The auto-linker skipped a broken rule. Please upload your custom CSV below to apply perfect rules.")
-            
-        if precedence_list:
-            prec_df = pd.DataFrame(precedence_list).drop_duplicates()
-        else:
-            prec_df = pd.DataFrame(columns=["Before Operation", "After Operation"])
+            if str(sub_id).startswith("Merge:"):
+                parts = str(sub_id).replace("Merge:", "").split("+")
+                for part in parts:
+                    target_sub_id = part.strip()
+                    target_group = edited_df[edited_df['Sub-Assembly ID'] == target_sub_id]
+                    if not target_group.empty:
+                        last_op = target_group['Operation Description'].iloc[-1]
+                        first_merge_op = ops[0]
+                        precedence_list.append({"Before Operation": last_op, "After Operation": first_merge_op})
+        
+        prec_df = pd.DataFrame(precedence_list).drop_duplicates()
         
         # --- STEP 3: REVIEW PRECEDENCE & FLOWCHART ---
         st.divider()
         st.header("Step 3: Review Precedence Flow")
         st.markdown("The system auto-linked sequences and merges. **Add or delete rows in the table below to fix any logic errors.**")
         
-        st.info("💡 **Have a saved precedence table?** Upload it here to immediately override the auto-generated logic.")
-        prec_upload = st.file_uploader("Upload Saved Precedence Table (CSV)", type=["csv"], key="prec_uploader")
-        
-        if prec_upload is not None:
-            uploaded_prec = pd.read_csv(prec_upload, sep=None, engine='python')
-            if 'Before Operation' in uploaded_prec.columns and 'After Operation' in uploaded_prec.columns:
-                prec_df = uploaded_prec
-                st.success("✅ Custom Precedence applied!")
-            else:
-                st.error("❌ The uploaded CSV must contain 'Before Operation' and 'After Operation' columns.")
-
         col_table, col_chart = st.columns([1, 1.5])
         
         with col_table:
             edited_prec_df = st.data_editor(prec_df, num_rows="dynamic", use_container_width=True)
-            csv_prec = edited_prec_df.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Download This Precedence Table", data=csv_prec, file_name="custom_precedence.csv", mime="text/csv", use_container_width=True)
         
         with col_chart:
             st.markdown("### Precedence Flowchart")
@@ -236,6 +218,8 @@ if uploaded_file is not None:
         st.header("Step 4: Run Math Engine")
         
         if st.button("🚀 Confirm Flow & Run Optimization", type="primary"):
+            
+            # Final Safety Catch for User Inputs
             if mode == "Type 1: Minimize Headcount" and target_cycle_time is None: target_cycle_time = 1.5
             
             edited_df['SAM'] = pd.to_numeric(edited_df['SAM'], errors='coerce').fillna(0.0)
@@ -243,6 +227,7 @@ if uploaded_file is not None:
             sam = dict(zip(edited_df['Operation Description'], edited_df['SAM']))
             machines = dict(zip(edited_df['Operation Description'], edited_df['Machine'].fillna("MANUAL")))
             machine_types = list(set(machines.values()))
+            total_sam = sum(sam.values())
             
             real_operator_cols = [col for col in edited_df.columns if col.startswith('Op_')]
             num_real_operators = len(real_operator_cols)
