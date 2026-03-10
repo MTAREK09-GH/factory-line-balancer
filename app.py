@@ -75,11 +75,11 @@ def run_solver(operations, sam, machines, machine_types, precedence, efficiency,
 # --- UI SETUP ---
 st.set_page_config(page_title="Universal Line Balancer", layout="wide")
 st.title("🏭 Universal Line Balancing Engine")
-st.markdown("Upload data, review auto-generated precedence, and optimize.")
+st.markdown("Upload data, apply your Precedence CSV, and run the math.")
 
 # --- SIDEBAR INPUTS ---
 st.sidebar.header("Optimization Mode")
-mode = st.sidebar.radio("What is your goal today?", ("Type 1: Minimize Headcount", "Type 2: Minimize Cycle Time", "Type E: Maximize Efficiency"))
+mode = st.sidebar.radio("What is your goal today?", ("Type 1: Minimize Headcount", "Type 2: Minimize Cycle Time"))
 st.sidebar.divider()
 st.sidebar.header("Factory Constraints")
 max_machines = st.sidebar.number_input("Max Machines per Station", min_value=1, value=1, step=1)
@@ -89,18 +89,14 @@ if mode == "Type 1: Minimize Headcount":
     max_allowed_headcount = st.sidebar.slider("Max Allowed Workers", 1, 100, 30)
 elif mode == "Type 2: Minimize Cycle Time":
     fixed_workstations = st.sidebar.number_input("Fixed Number of Workers", min_value=1, max_value=100, value=25, step=1)
-    shift_minutes = st.sidebar.number_input("Working Minutes per Shift", min_value=60, value=480, step=30)
-else:
-    min_w = st.sidebar.number_input("Minimum Workers", min_value=1, max_value=100, value=15, step=1)
-    max_w = st.sidebar.number_input("Maximum Workers", min_value=2, max_value=100, value=35, step=1)
 
 # --- STEP 1: UPLOAD & BULLETPROOF CLEANING ---
-st.header("Step 1: Upload Excel/CSV")
+st.header("Step 1: Upload Main SAM List")
 uploaded_file = st.file_uploader("Upload your Operation Bulletin", type=["xlsx", "csv"])
 
 if uploaded_file is not None:
     try:
-        if uploaded_file.name.endswith('.csv'): df = pd.read_csv(uploaded_file)
+        if uploaded_file.name.endswith('.csv'): df = pd.read_csv(uploaded_file, sep=None, engine='python')
         else: df = pd.read_excel(uploaded_file)
         
         if 'Operation Description' not in df.columns and 'Operation' in df.columns:
@@ -109,110 +105,35 @@ if uploaded_file is not None:
         df['Operation Description'] = df['Operation Description'].astype(str).str.strip().str.upper()
         df = df[~df['Operation Description'].isin(['', 'NAN', 'NONE', 'NULL'])]
         
-        if 'SAM' in df.columns:
-            df['SAM'] = pd.to_numeric(df['SAM'], errors='coerce').fillna(0.0)
-        else:
-            df['SAM'] = 0.0
-            
-        base_sub_ids = []
-        for index, row in df.iterrows():
-            sam_val = row['SAM']
-            desc = row['Operation Description']
-            if sam_val == 0.0 and desc not in base_sub_ids:
-                base_sub_ids.append(desc)
-                        
-        current_sub_id = "General Assembly"
-        valid_rows = []
-        ignore_keywords = ["ASSEMBLY", "TAPE", "BINDING", "THE", "AND", "WITH"]
+        if 'SAM' not in df.columns: df['SAM'] = 0.0
+        df['SAM'] = pd.to_numeric(df['SAM'], errors='coerce').fillna(0.0)
+        if 'Machine' not in df.columns: df['Machine'] = "MANUAL"
         
-        for index, row in df.iterrows():
-            sam_val = row['SAM']
-            desc = row['Operation Description']
-            
-            if sam_val == 0.0:
-                current_sub_id = desc
-            else:
-                assigned_id = current_sub_id
-                if "ASSEMBLE" in desc or "JOIN" in desc or "ATTACH" in desc:
-                    for base_id in base_sub_ids:
-                        if base_id == current_sub_id: continue 
-                        
-                        keywords = [k for k in base_id.replace('+', ' ').replace('/', ' ').split() if len(k) > 3 and k not in ignore_keywords]
-                        match_found = False
-                        for kw in keywords:
-                            if kw in desc: match_found = True; break
-                                
-                        if match_found:
-                            assigned_id = f"Merge: {current_sub_id} + {base_id}"
-                            break 
-                
-                row['Sub-Assembly ID'] = assigned_id
-                valid_rows.append(row)
-                
-        clean_df = pd.DataFrame(valid_rows)
+        st.markdown("**Editable Operations List:**")
+        # Hide the ugly index numbers
+        edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True, hide_index=True)
         
-        # --- STEP 2: REVIEW SUB-ASSEMBLY IDS ---
+        # --- STEP 2: REVIEW PRECEDENCE & FLOWCHART ---
         st.divider()
-        st.header("Step 2: Review Sub-Assembly Tags")
-        st.markdown("The Smart Tagger assigned components and predicted Merges. **Click any cell in the 'Sub-Assembly ID' column to edit.**")
-        
-        # HIDE INDEX REMOVES THE UGLY ROW NUMBERS
-        edited_df = st.data_editor(clean_df, num_rows="dynamic", use_container_width=True, hide_index=True)
-        
-        # --- AUTO-PRECEDENCE & MERGE LINKING LOGIC ---
-        precedence_list = []
-        
-        try:
-            edited_df['Sub-Assembly ID'] = edited_df['Sub-Assembly ID'].astype(str)
-            for sub_id, group in edited_df.groupby('Sub-Assembly ID', sort=False):
-                ops = group['Operation Description'].dropna().tolist()
-                
-                # ABSOLUTE SAFETY LOCK
-                if len(ops) == 0: continue 
-                
-                for i in range(len(ops)-1):
-                    precedence_list.append({"Before Operation": ops[i], "After Operation": ops[i+1]})
-                    
-                if str(sub_id).startswith("Merge:"):
-                    parts = str(sub_id).replace("Merge:", "").split("+")
-                    for part in parts:
-                        target_sub_id = part.strip()
-                        target_group = edited_df[edited_df['Sub-Assembly ID'] == target_sub_id]
-                        t_ops = target_group['Operation Description'].dropna().tolist()
-                        
-                        # DOUBLE SAFETY LOCK
-                        if len(t_ops) > 0 and len(ops) > 0:
-                            last_op = t_ops[-1]
-                            first_merge_op = ops[0]
-                            precedence_list.append({"Before Operation": last_op, "After Operation": first_merge_op})
-        except Exception as e:
-            st.warning("⚠️ The auto-linker skipped a broken rule. Please upload your custom CSV below to apply perfect rules.")
-            
-        if precedence_list:
-            prec_df = pd.DataFrame(precedence_list).drop_duplicates()
-        else:
-            prec_df = pd.DataFrame(columns=["Before Operation", "After Operation"])
-        
-        # --- STEP 3: REVIEW PRECEDENCE & FLOWCHART ---
-        st.divider()
-        st.header("Step 3: Review Precedence Flow")
-        st.markdown("The system auto-linked sequences and merges. **Add or delete rows in the table below to fix any logic errors.**")
-        
-        st.info("💡 **Have a saved precedence table?** Upload it here to immediately override the auto-generated logic.")
+        st.header("Step 2: Precedence Flow")
+        st.info("💡 **Upload your saved Precedence Table (CSV) here.**")
         prec_upload = st.file_uploader("Upload Saved Precedence Table (CSV)", type=["csv"], key="prec_uploader")
         
         if prec_upload is not None:
-            uploaded_prec = pd.read_csv(prec_upload, sep=None, engine='python')
-            if 'Before Operation' in uploaded_prec.columns and 'After Operation' in uploaded_prec.columns:
-                prec_df = uploaded_prec
+            prec_df = pd.read_csv(prec_upload, sep=None, engine='python')
+            if 'Before Operation' in prec_df.columns and 'After Operation' in prec_df.columns:
                 st.success("✅ Custom Precedence applied!")
             else:
-                st.error("❌ The uploaded CSV must contain 'Before Operation' and 'After Operation' columns.")
+                st.error("❌ Invalid CSV format.")
+        else:
+            ops = edited_df['Operation Description'].tolist()
+            prec_list = [{"Before Operation": ops[i], "After Operation": ops[i+1]} for i in range(len(ops)-1)] if len(ops)>1 else []
+            prec_df = pd.DataFrame(prec_list, columns=["Before Operation", "After Operation"])
 
         col_table, col_chart = st.columns([1, 1.5])
         
         with col_table:
-            # HIDE INDEX REMOVES THE "NONE" BOXES FOREVER
+            # Hide the ugly index numbers here too!
             edited_prec_df = st.data_editor(prec_df, num_rows="dynamic", use_container_width=True, hide_index=True)
             csv_prec = edited_prec_df.to_csv(index=False).encode('utf-8')
             st.download_button("📥 Download This Precedence Table", data=csv_prec, file_name="custom_precedence.csv", mime="text/csv", use_container_width=True)
@@ -225,23 +146,19 @@ if uploaded_file is not None:
             
             final_precedence_tuples = []
             for idx, row in edited_prec_df.iterrows():
-                if pd.notna(row.get('Before Operation')) and pd.notna(row.get('After Operation')):
-                    before_str = str(row['Before Operation']).strip()
-                    after_str = str(row['After Operation']).strip()
-                    if before_str and after_str:
-                        dot.edge(before_str, after_str)
-                        final_precedence_tuples.append((before_str, after_str))
-                        
+                before_str = str(row.get('Before Operation', '')).strip()
+                after_str = str(row.get('After Operation', '')).strip()
+                if before_str and after_str and before_str != 'nan' and after_str != 'nan':
+                    dot.edge(before_str, after_str)
+                    final_precedence_tuples.append((before_str, after_str))
+                    
             st.graphviz_chart(dot)
 
-        # --- STEP 4: OPTIMIZATION ENGINE ---
+        # --- STEP 3: OPTIMIZATION ENGINE ---
         st.divider()
-        st.header("Step 4: Run Math Engine")
+        st.header("Step 3: Run Math Engine")
         
         if st.button("🚀 Confirm Flow & Run Optimization", type="primary"):
-            if mode == "Type 1: Minimize Headcount" and target_cycle_time is None: target_cycle_time = 1.5
-            
-            edited_df['SAM'] = pd.to_numeric(edited_df['SAM'], errors='coerce').fillna(0.0)
             operations = edited_df['Operation Description'].astype(str).tolist()
             sam = dict(zip(edited_df['Operation Description'], edited_df['SAM']))
             machines = dict(zip(edited_df['Operation Description'], edited_df['Machine'].fillna("MANUAL")))
@@ -261,7 +178,6 @@ if uploaded_file is not None:
                     else:
                         efficiency[op_name][j] = 1.0
 
-            # --- VALIDATION SHIELD ---
             valid_precedence = []
             missing_ops = set()
             for b, a in final_precedence_tuples:
@@ -272,11 +188,11 @@ if uploaded_file is not None:
                     if a not in operations: missing_ops.add(a)
                     
             if missing_ops:
-                st.warning(f"⚠️ **Warning:** The following operations in your Precedence Table do not exactly match the operations in your Step 1 data (check for typos or extra spaces). Their precedence rules were ignored to prevent a crash: \n\n {', '.join(missing_ops)}")
+                st.warning(f"⚠️ **Warning:** The following operations in your Precedence Table do not exactly match the operations in your Step 1 data (check for typos). Their precedence rules were ignored: \n\n {', '.join(missing_ops)}")
 
             final_status, final_x, final_y, final_headcount, final_cycle_time = None, None, None, None, None
             
-            with st.spinner(f'Executing {mode} Mathematics...'):
+            with st.spinner(f'Executing Mathematics...'):
                 if mode == "Type 1: Minimize Headcount":
                     final_status, final_x, final_y, final_headcount, final_cycle_time = run_solver(
                         operations, sam, machines, machine_types, valid_precedence, efficiency, max_allowed_headcount, mode, target_cycle_time, max_machines)
